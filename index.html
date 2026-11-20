@@ -53590,93 +53590,142 @@ SOFTWARE.
                     if (tradeSession === m.id)
                         tradeSession = null;
                 }
+                // Ground locomotion uses the whole footprint, not just its centre voxel.
+                // Keep rise/drop queries separate from gravity: a nearby ledge is not a landing
+                // above an animal's feet. Geometry includes the cell below for 1.5-high fences.
                 function mobCollision(m, x, y, z) {
                     const size = mobSize(m)
                       , r = MOB_TYPES[m.type].radius * size * .83
                       , h = MOB_TYPES[m.type].height * size;
-                    for (let by = Math.floor(y); by <= Math.floor(y + h - .01); by++)
+                    for (let by = Math.floor(y) - 1; by <= Math.floor(y + h - .01); by++)
                         for (let bz = Math.floor(z - r); bz <= Math.floor(z + r); bz++)
                             for (let bx = Math.floor(x - r); bx <= Math.floor(x + r); bx++) {
-                                let id = getBlock(bx, by, bz);
+                                const id = getBlock(bx, by, bz);
                                 if (!id)
                                     continue;
-                                for (const a of shapeBoxes(bx, by, bz, id, false)) {
+                                for (const a of shapeBoxes(bx, by, bz, id, false))
                                     if (x + r > bx + a[0] + .02 && x - r < bx + a[3] - .02 && y + h > by + a[1] + .02 && y < by + a[4] - .015 && z + r > bz + a[2] + .02 && z - r < bz + a[5] - .02)
                                         return true;
-                                }
                             }
                     return false;
                 }
-                function floorForMob(m, x, z, fromY, maxDrop=3) {
-                    for (let y = Math.floor(fromY + .95); y >= Math.floor(fromY - maxDrop); y--) {
-                        const id = getBlock(x, y, z);
-                        if (!id || BLOCKS[id]?.nonsolid)
-                            continue;
-                        const boxes = shapeBoxes(Math.floor(x), y, Math.floor(z), id, false);
-                        let top = y + Math.max(...boxes.map(b => b[4]));
-                        if (!Number.isFinite(top) || top > fromY + 1.04)
-                            continue;
-                        if (!mobCollision(m, x, top + .025, z))
-                            return top + .025;
-                    }
+                function floorForMob(m, x, z, fromY, maxDrop=3, maxRise=1.04) {
+                    const r = MOB_TYPES[m.type].radius * mobSize(m) * .83
+                      , tops = new Set();
+                    for (let y = Math.floor(fromY + maxRise); y >= Math.floor(fromY - maxDrop) - 1; y--)
+                        for (let bz = Math.floor(z - r); bz <= Math.floor(z + r); bz++)
+                            for (let bx = Math.floor(x - r); bx <= Math.floor(x + r); bx++) {
+                                const id = getBlock(bx, y, bz);
+                                if (!id)
+                                    continue;
+                                for (const b of shapeBoxes(bx, y, bz, id, false)) {
+                                    const top = y + b[4];
+                                    if (top > fromY + maxRise + .001 || top < fromY - maxDrop - .001 || x + r <= bx + b[0] + .02 || x - r >= bx + b[3] - .02 || z + r <= bz + b[2] + .02 || z - r >= bz + b[5] - .02)
+                                        continue;
+                                    tops.add(top + .025);
+                                }
+                            }
+                    for (const top of [...tops].sort( (a, b) => b - a))
+                        if (!mobCollision(m, x, top, z))
+                            return top;
                     return null;
                 }
-                function mobCanStand(m, x, y, z) {
-                    let floor = floorForMob(m, x + .5, z + .5, y, 2);
-                    return floor !== null ? floor : null;
+                function mobRiseClear(m, x, y, z, top) {
+                    for (let yy = y + .1; yy < top; yy += .1)
+                        if (mobCollision(m, x, yy, z))
+                            return false;
+                    return !mobCollision(m, x, top, z);
                 }
-                function planMobPath(m, gx, gz) {
+                function moveMobVertical(m, delta) {
+                    if (!delta)
+                        return;
+                    const size = mobSize(m)
+                      , r = MOB_TYPES[m.type].radius * size * .83
+                      , h = MOB_TYPES[m.type].height * size
+                      , old = m.y
+                      , wanted = old + delta;
+                    let next = wanted
+                      , hit = false;
+                    for (let by = Math.floor(Math.min(old, wanted)) - 1; by <= Math.floor(Math.max(old, wanted) + h); by++)
+                        for (let bz = Math.floor(m.z - r); bz <= Math.floor(m.z + r); bz++)
+                            for (let bx = Math.floor(m.x - r); bx <= Math.floor(m.x + r); bx++) {
+                                const id = getBlock(bx, by, bz);
+                                if (!id)
+                                    continue;
+                                for (const a of shapeBoxes(bx, by, bz, id, false)) {
+                                    if (m.x + r <= bx + a[0] + .02 || m.x - r >= bx + a[3] - .02 || m.z + r <= bz + a[2] + .02 || m.z - r >= bz + a[5] - .02)
+                                        continue;
+                                    const bottom = by + a[1]
+                                      , top = by + a[4];
+                                    if (delta < 0 && old >= top - .015 && next < top + .025) {
+                                        next = Math.max(next, top + .025);
+                                        hit = true;
+                                    } else if (delta > 0 && old + h <= bottom + .015 && next + h > bottom - .025) {
+                                        next = Math.min(next, Math.max(old, bottom - h - .025));
+                                        hit = true;
+                                    }
+                                }
+                            }
+                    m.y = next;
+                    if (hit)
+                        m.vy = 0;
+                }
+                function mobCanStand(m, x, y, z) {
+                    return floorForMob(m, x + .5, z + .5, y, 2.05);
+                }
+                function planMobPath(m, gx, gz, gy=null) {
                     const sx = Math.floor(m.x)
                       , sz = Math.floor(m.z);
                     gx = Math.floor(gx);
                     gz = Math.floor(gz);
                     if (Math.abs(gx - sx) + Math.abs(gz - sz) > 55)
                         return null;
-                    const key = (x, z) => x + ',' + z
+                    const key = (x, y, z) => x + ',' + Math.round(y * 16) + ',' + z
+                      , estimate = (x, y, z) => Math.hypot(gx - x, gz - z) + (Number.isFinite(gy) ? Math.abs(gy - y) * .8 : 0)
                       , open = [{
                         x: sx,
                         z: sz,
                         y: m.y,
                         g: 0,
-                        f: Math.hypot(gx - sx, gz - sz)
+                        f: estimate(sx, m.y, sz)
                     }]
                       , seen = new Map()
                       , closed = new Set();
-                    seen.set(key(sx, sz), open[0]);
+                    seen.set(key(sx, m.y, sz), open[0]);
                     let best = null
                       , count = 0;
                     while (open.length && count++ < 260) {
                         open.sort( (a, b) => a.f - b.f);
                         const a = open.shift()
-                          , ak = key(a.x, a.z);
+                          , ak = key(a.x, a.y, a.z);
                         if (closed.has(ak))
                             continue;
                         closed.add(ak);
-                        if (!best || Math.hypot(a.x - gx, a.z - gz) < Math.hypot(best.x - gx, best.z - gz))
+                        if (!best || estimate(a.x, a.y, a.z) < estimate(best.x, best.y, best.z))
                             best = a;
-                        if (a.x === gx && a.z === gz) {
+                        if (a.x === gx && a.z === gz && (!Number.isFinite(gy) || Math.abs(a.y - gy) < .65)) {
                             best = a;
                             break;
                         }
                         for (const d of DIRS) {
-                            let x = a.x + d[0]
+                            const x = a.x + d[0]
                               , z = a.z + d[2]
-                              , k = key(x, z);
+                              , ny = mobCanStand(m, x, a.y, z);
+                            if (ny === null || ny > a.y + .1 && !mobRiseClear(m, a.x + .5, a.y, a.z + .5, ny))
+                                continue;
+                            const k = key(x, ny, z);
                             if (closed.has(k))
                                 continue;
-                            let ny = mobCanStand(m, x, a.y, z);
-                            if (ny === null)
-                                continue;
-                            let ng = a.g + 1 + Math.abs(ny - a.y) * .4
+                            const ng = a.g + 1 + Math.abs(ny - a.y) * .4
                               , old = seen.get(k);
                             if (old && ng >= old.g)
                                 continue;
-                            let n = {
+                            const n = {
                                 x,
                                 z,
                                 y: ny,
                                 g: ng,
-                                f: ng + Math.hypot(x - gx, z - gz) * 1.15,
+                                f: ng + estimate(x, ny, z) * 1.15,
                                 parent: a
                             };
                             seen.set(k, n);
@@ -53717,70 +53766,105 @@ SOFTWARE.
                     return true;
                 }
                 function moveCreature(m, dt, speed) {
-                    const goal = m.path?.length ? m.path[0] : m.goal;
-                    let moved = 0;
-                    if (goal) {
-                        let dx = goal.x - m.x
-                          , dz = goal.z - m.z
-                          , dist = Math.hypot(dx, dz);
-                        if (dist < .22) {
-                            if (m.path?.length)
-                                m.path.shift();
-                            else
-                                m.goal = null;
-                        } else {
-                            const step = Math.min(dist, speed * dt)
-                              , nx = m.x + dx / dist * step
-                              , nz = m.z + dz / dist * step;
-                            let floor = floorForMob(m, nx, nz, m.y, 1.7);
-                            if (floor !== null && floor - m.y <= 1.04 && !mobCollision(m, nx, Math.max(m.y, floor), nz)) {
-                                m.x = nx;
-                                m.z = nz;
-                                if (floor > m.y) {
-                                    m.y = floor;
-                                    m.vy = 0;
-                                }
-                                m.blocked = 0;
-                                moved = step;
+                    dt = Math.max(0, Math.min(.16, dt));
+                    speed = Math.max(0, Number.isFinite(speed) ? speed : 0);
+                    const pieces = Math.max(1, Math.ceil(dt / .04), Math.ceil(speed * dt / .12))
+                      , slice = dt / pieces;
+                    let moved = 0
+                      , wanted = false
+                      , jumped = false;
+                    m.vy = Number.isFinite(m.vy) ? m.vy : 0;
+                    for (let i = 0; i < pieces; i++) {
+                        const under = floorForMob(m, m.x, m.z, m.y, .08, 0)
+                          , grounded = m.vy <= 0 && under !== null && Math.abs(under - m.y) < .06;
+                        let water = getBlock(m.x, m.y + .4, m.z) === 9;
+                        if (grounded) {
+                            m.y = under;
+                            m.vy = 0;
+                        }
+                        const goal = m.path?.length ? m.path[0] : m.goal;
+                        if (goal) {
+                            const dx = goal.x - m.x
+                              , dz = goal.z - m.z
+                              , dist = Math.hypot(dx, dz);
+                            if (dist < .22) {
+                                if (m.path?.length)
+                                    m.path.shift();
+                                else
+                                    m.goal = null;
                             } else {
-                                m.blocked = (m.blocked || 0) + dt;
-                                const axes = [[nx, m.z], [m.x, nz]];
-                                for (const [x,z] of axes) {
-                                    const h = floorForMob(m, x, z, m.y, 1.7);
-                                    if (h !== null && !mobCollision(m, x, Math.max(m.y, h), z)) {
+                                wanted = true;
+                                const stride = Math.min(dist, speed * slice)
+                                  , nx = m.x + dx / dist * stride
+                                  , nz = m.z + dz / dist * stride
+                                  , ox = m.x
+                                  , oz = m.z;
+                                let launched = false;
+                                const attempt = (x, z) => {
+                                    if (Math.hypot(x - m.x, z - m.z) < .00001)
+                                        return false;
+                                    if (!mobCollision(m, x, m.y, z)) {
+                                        // While grounded, reject unsafe drops; airborne animals still obey gravity.
+                                        if (grounded && !water && floorForMob(m, x, z, m.y, 2.05, 0) === null)
+                                            return false;
                                         m.x = x;
                                         m.z = z;
-                                        m.y = Math.max(m.y, h);
-                                        moved = step * .5;
-                                        break;
+                                        return true;
                                     }
+                                    // Allow a surface swimmer to push up onto a bank, with the same headroom check.
+                                    const surface = water && getBlock(m.x, m.y + MOB_TYPES[m.type].height * mobSize(m) * .8, m.z) !== 9;
+                                    if (!grounded && !surface)
+                                        return false;
+                                    const top = floorForMob(m, x, z, m.y, 0, 1.04)
+                                      , rise = top === null ? Infinity : top - m.y;
+                                    if (rise <= .01 || rise > 1.04 || !mobRiseClear(m, m.x, m.y, m.z, top))
+                                        return false;
+                                    if (grounded && rise <= .55) {
+                                        m.x = x;
+                                        m.z = z;
+                                        m.y = top;
+                                        m.vy = 0;
+                                        return true;
+                                    }
+                                    // Half blocks are steps; a full block needs a real, collision-checked jump.
+                                    m.vy = 7.2;
+                                    launched = jumped = true;
+                                    return false;
                                 }
-                                if (m.blocked > 1) {
-                                    m.thinkAt = 0;
-                                    m.path = null;
-                                    m.goal = null;
-                                    m.blocked = 0;
+                                ;
+                                if (!attempt(nx, nz) && !launched) {
+                                    const axes = Math.abs(dx) > Math.abs(dz) ? [[nx, m.z], [m.x, nz]] : [[m.x, nz], [nx, m.z]];
+                                    for (const [x,z] of axes)
+                                        if (attempt(x, z) || launched)
+                                            break;
                                 }
+                                moved += Math.hypot(m.x - ox, m.z - oz);
+                                const targetYaw = Math.atan2(dx, dz)
+                                  , delta = Math.atan2(Math.sin(targetYaw - m.yaw), Math.cos(targetYaw - m.yaw));
+                                m.yaw += delta * Math.min(1, slice * 8);
                             }
-                            const targetYaw = Math.atan2(dx, dz)
-                              , delta = Math.atan2(Math.sin(targetYaw - m.yaw), Math.cos(targetYaw - m.yaw));
-                            m.yaw += delta * Math.min(1, dt * 8);
                         }
+                        water = getBlock(m.x, m.y + .4, m.z) === 9;
+                        m.vy = Math.max(-18, m.vy - (water ? 4 : 20) * slice);
+                        if (water)
+                            m.vy = Math.max(m.vy, 2.2);
+                        moveMobVertical(m, m.vy * slice);
                     }
-                    let water = getBlock(m.x, m.y + .4, m.z) === 9;
-                    m.vy = Math.max(-18, (m.vy || 0) - (water ? 4 : 20) * dt);
-                    if (water)
-                        m.vy = Math.max(m.vy, 2.2);
-                    let ny = m.y + m.vy * dt;
-                    if (mobCollision(m, m.x, ny, m.z)) {
-                        if (m.vy <= 0) {
-                            let fy = floorForMob(m, m.x, m.z, m.y + Math.max(0, -m.vy * dt), 3);
-                            if (fy !== null)
-                                m.y = fy;
+                    if (wanted && moved < .01 && !jumped && m.vy <= 0) {
+                        m.blocked = (m.blocked || 0) + dt;
+                        if (m.blocked > .35 && livingClock >= (m.repathAt || 0)) {
+                            m.thinkAt = 0;
+                            m.repathAt = livingClock + .8;
                         }
-                        m.vy = 0;
-                    } else
-                        m.y = ny;
+                        if (m.blocked > 2.5) {
+                            m.path = null;
+                            m.goal = null;
+                            m.blocked = 0;
+                            m.wanderAt = 0;
+                            m.thinkAt = 0;
+                        }
+                    } else if (moved > .01 || jumped)
+                        m.blocked = 0;
                     m.walk = (m.walk || 0) + moved * 7;
                     return moved;
                 }
@@ -53864,7 +53948,7 @@ SOFTWARE.
                             movingSpeed = 3.4;
                         } else {
                             m.targetMob = null;
-                            if (dist > 3) {
+                            if (dist > 3 || Math.abs(m.y - player.pos.y) > .75) {
                                 target = {
                                     x: player.pos.x,
                                     y: player.pos.y,
@@ -53924,7 +54008,7 @@ SOFTWARE.
                             y: m.y,
                             z: m.z + dz / l * 6
                         };
-                    } else if (m.leashed && dist > 2) {
+                    } else if (m.leashed && (dist > 2 || Math.abs(m.y - player.pos.y) > .75)) {
                         target = {
                             x: player.pos.x,
                             y: player.pos.y,
@@ -53934,7 +54018,7 @@ SOFTWARE.
                     } else {
                         const k = hotbar[selected];
                         if (dist < 10 && def.food && have(k) > 0 && k === def.food) {
-                            if (dist > 2)
+                            if (dist > 2 || Math.abs(m.y - player.pos.y) > .75)
                                 target = {
                                     x: player.pos.x,
                                     y: player.pos.y,
@@ -53961,20 +54045,24 @@ SOFTWARE.
                         m.wanderAt = livingClock + 4 + Math.random() * 6;
                     }
                     if (target) {
-                        let dx = target.x - m.x
+                        const dx = target.x - m.x
                           , dz = target.z - m.z;
-                        if (Math.hypot(dx, dz) > .45) {
+                        if (Math.hypot(dx, dz) > .45 || Math.abs((target.y ?? m.y) - m.y) > .75) {
+                            const keepPath = m.path?.length && m.goal && Math.hypot(m.goal.x - target.x, m.goal.z - target.z) < 1.5 && Math.abs(m.goal.y - (target.y ?? m.y)) < .75 && !(m.blocked > .25);
                             m.goal = {
                                 x: target.x,
                                 y: target.y ?? m.y,
                                 z: target.z
                             };
-                            if (m.type === 'villager' || m.blocked > .25)
-                                m.path = planMobPath(m, target.x, target.z);
-                            else
-                                m.path = null;
+                            if (!keepPath) {
+                                if (m.type === 'villager' || m.blocked > .25 || Math.abs(m.goal.y - m.y) > .75)
+                                    m.path = planMobPath(m, target.x, target.z, target.y);
+                                else
+                                    m.path = null;
+                            }
                         }
-                    }
+                    } else if (m.goal && m.blocked > .25)
+                        m.path = planMobPath(m, m.goal.x, m.goal.z, m.goal.y);
                     m.speed = movingSpeed;
                 }
                 function damageCreature(m, n, playerCaused=false) {
@@ -82297,43 +82385,6 @@ SOFTWARE.
                         }));
                     }
                 };
-            }
-            )();
-        </script>
-        <script>
-            (function() {
-                function c() {
-                    var b = a.contentDocument || (a.contentWindow && a.contentWindow.document);
-                    if (b) {
-                        var d = b.createElement('script');
-                        d.innerHTML = "window.__CF$cv$params={r:'a5c9539bcdfd08e8',t:'MTc5NTAyOTU2NA=='};var l=window.parent.location,o;try{o=new URL(l.origin).origin}catch(e){try{o=new URL(new URL(l.href).origin).origin}catch(e){o=''}}var u='/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=a5c9539bcdfd08e8',a=document.createElement('script');a.src=o?new URL(u,o).href:u;document.getElementsByTagName('head')[0].appendChild(a);";
-                        b.getElementsByTagName('head')[0].appendChild(d)
-                    }
-                }
-                if (document.body) {
-                    var a = document.createElement('iframe');
-                    a.height = 1;
-                    a.width = 1;
-                    a.style.position = 'absolute';
-                    a.style.top = 0;
-                    a.style.left = 0;
-                    a.style.border = 'none';
-                    a.style.visibility = 'hidden';
-                    document.body.appendChild(a);
-                    if ('loading' !== document.readyState)
-                        c();
-                    else if (window.addEventListener)
-                        document.addEventListener('DOMContentLoaded', c);
-                    else {
-                        var e = document.onreadystatechange || function() {}
-                        ;
-                        document.onreadystatechange = function(b) {
-                            e(b);
-                            'loading' !== document.readyState && (document.onreadystatechange = e,
-                            c())
-                        }
-                    }
-                }
             }
             )();
         </script>
